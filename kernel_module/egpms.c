@@ -37,6 +37,7 @@
 #define EGPMS_TIMEOUT 2000
 
 #define EGPMS_CMD_SIZE 2
+#define EGPMS_SCHED_CMD_SIZE 5
 
 /* Time extension, if set, this event is a extension time cell */
 #define EGPMS_SCHED_FLAG_TIME_EXT BIT(14)
@@ -108,8 +109,8 @@ static ssize_t egpms_outlet_show(struct device *dev, struct device_attribute *at
 			0x01,
 			USB_TYPE_CLASS | USB_RECIP_INTERFACE | USB_DIR_IN,
 			EGPMS_URB_BASE + EGPMS_URB_OUTLET(outlet_id),
-			0, cmd, sizeof(cmd), EGPMS_TIMEOUT);
-	if (ret != sizeof(cmd)) {
+			0, cmd, EGPMS_CMD_SIZE, EGPMS_TIMEOUT);
+	if (ret != EGPMS_CMD_SIZE) {
 		dev_err(&egpms->udev->dev,
 				"Failed to get outlet %u state (%d)\n",
 				outlet_id, ret);
@@ -141,7 +142,12 @@ static ssize_t egpms_outlet_store(struct device *dev,
 	unsigned int outlet_id = ext_attr->outlet_id;
 	bool enable;
 	int ret;
-	unsigned char cmd[2];
+	unsigned char *cmd;
+
+	cmd = kmalloc(EGPMS_CMD_SIZE, GFP_DMA | GFP_KERNEL);
+	if (!cmd) {
+		goto error_malloc;
+	}
 
 	if (!strncmp("enable", buf, strlen("enable")) ||
 			!strncmp("on", buf, strlen("on"))) {
@@ -169,17 +175,20 @@ static ssize_t egpms_outlet_store(struct device *dev,
 			0x09,
 			USB_TYPE_CLASS | USB_RECIP_INTERFACE | USB_DIR_OUT,
 			EGPMS_URB_BASE + EGPMS_URB_OUTLET(outlet_id),
-			0, cmd, sizeof(cmd), EGPMS_TIMEOUT);
-	if (ret != sizeof(cmd))
+			0, cmd, EGPMS_CMD_SIZE, EGPMS_TIMEOUT);
+	if (ret != EGPMS_CMD_SIZE)
 		dev_err(&egpms->udev->dev, "Failed setting outlet, retval: %d\n",
 				ret);
 
-
+	kfree(cmd);
 	return count;
-
 error_out:
+	kfree(cmd);
 	dev_err(&egpms->udev->dev, "Invalid state, only '0' and '1' allowed");
 	return count;
+error_malloc:
+	dev_err(&egpms->udev->dev, "Cannot allocate command memory");
+	return 0;
 }
 
 static ssize_t egpms_serial_id_show(struct device *dev,
@@ -188,22 +197,33 @@ static ssize_t egpms_serial_id_show(struct device *dev,
 	int ret;
 	struct usb_interface *intf = to_usb_interface(dev);
 	struct egpms_data *egpms = usb_get_intfdata(intf);
-	unsigned char data[5] = {0, 0, 0, 0, 0};
+	unsigned char *data;
+	data = kmalloc(EGPMS_SCHED_CMD_SIZE, GFP_DMA | GFP_KERNEL);
+	if (!data) {
+		goto error_malloc;
+	}
+	memset(data, 0, EGPMS_SCHED_CMD_SIZE);
 
 	ret = usb_control_msg(egpms->udev, usb_rcvctrlpipe(egpms->udev, 0),
 			0x01,
 			USB_TYPE_CLASS | USB_RECIP_INTERFACE | USB_DIR_IN,
 			EGPMS_URB_BASE + EGPMS_URB_SERIAL,
-			0, data, sizeof(data), EGPMS_TIMEOUT);
-	if (ret != sizeof(data))
+			0, data, EGPMS_SCHED_CMD_SIZE, EGPMS_TIMEOUT);
+	if (ret != EGPMS_SCHED_CMD_SIZE)
 		goto error;
 
-	return sprintf(buf, "%02x:%02x:%02x:%02x:%02x\n",
+	ret = sprintf(buf, "%02x:%02x:%02x:%02x:%02x\n",
 			data[0], data[1], data[2], data[3], data[4]);
+	kfree(data);
+	return ret;
 
 error:
+	kfree(data);
 	dev_err(&egpms->udev->dev, "Failed getting serial id (%d)\n", ret);
 	return sprintf(buf, "unknown\n");
+error_malloc:
+	dev_err(&egpms->udev->dev, "Cannot allocate data memory");
+	return 0;
 }
 DEVICE_ATTR(serial_id, S_IRUGO, egpms_serial_id_show, NULL);
 
@@ -269,48 +289,58 @@ static ssize_t egpms_outlet_sched_show(struct device *dev,
 			container_of(attr, struct egpms_ext_attr, attr);
 	unsigned int outlet_id = ext_attr->outlet_id;
 	int ret;
-	struct egpms_sched sched;
+	struct egpms_sched *sched = kmalloc(sizeof *sched, GFP_DMA | GFP_KERNEL);
 	u32 time = 0; /* minutes */
-	int i = ARRAY_SIZE(sched.events) - 1;
+	int i = ARRAY_SIZE(sched->events) - 1;
 	ssize_t count;
 	int esc = 0;
+
+	if (!sched) {
+		goto error_malloc;
+	}
 
 	ret = usb_control_msg(egpms->udev, usb_rcvctrlpipe(egpms->udev, 0),
 			0x01,
 			USB_TYPE_CLASS | USB_RECIP_INTERFACE | USB_DIR_IN,
 			EGPMS_URB_BASE + EGPMS_URB_OUTLET_SCHED(outlet_id),
-			0, &sched, sizeof(sched), EGPMS_TIMEOUT);
-	if (ret != sizeof(sched)) {
+			0, sched, sizeof(struct egpms_sched), EGPMS_TIMEOUT);
+	if (ret != sizeof(struct egpms_sched)) {
 		dev_err(&egpms->udev->dev, "Failed getting schedule, read %d/%u\n",
 				ret, (unsigned int)sizeof(sched));
+		kfree(sched);
 		return sprintf(buf, "Unknown schedule\n");
 	}
 
-	count = sprintf(buf, "%u:", sched.timestamp);
+	count = sprintf(buf, "%u:", sched->timestamp);
 
 	do {
-		if ((sched.events[i] & EGPMS_SCHED_TIME_MASK) ==
+		if ((sched->events[i] & EGPMS_SCHED_TIME_MASK) ==
 				EGPMS_SCHED_EMPTY) {
 			break;
 		} else {
-			time = egpms_calc_next_event_time(&sched, &i);
+			time = egpms_calc_next_event_time(sched, &i);
 
-			if ((sched.events[i] & EGPMS_SCHED_TIME_MASK) ==
+			if ((sched->events[i] & EGPMS_SCHED_TIME_MASK) ==
 					EGPMS_SCHED_EMPTY)
 				break;
 
 			count += sprintf(buf + count, "%u,%u;", time,
-					!!(sched.events[i] &
+					!!(sched->events[i] &
 						EGPMS_SCHED_FLAG_ENABLE));
 		}
-	} while (i != ARRAY_SIZE(sched.events) - 1 && ++esc < 100);
+	} while (i != ARRAY_SIZE(sched->events) - 1 && ++esc < 100);
 
 	if (time)
 		count += sprintf(buf + count, "%u\n", time);
 	else
 		count += sprintf(buf + count, "\n");
 
+	kfree(sched);
 	return count;
+
+error_malloc:
+	dev_err(&egpms->udev->dev, "Cannot allocate schedule struct memory");
+	return 0;
 }
 
 static ssize_t egpms_outlet_sched_store(struct device *dev,
@@ -324,21 +354,25 @@ static ssize_t egpms_outlet_sched_store(struct device *dev,
 	const char *line_split;
 	const char *line_start;
 	u32 event_time_delta; /* Minutes */
-	struct egpms_sched sched;
+	struct egpms_sched *sched = kmalloc(sizeof *sched, GFP_DMA | GFP_KERNEL);
 	int i;
 	int outlet_id = ext_attr->outlet_id;
 
-	memset(&sched, 0, sizeof(sched));
+	if (!sched) {
+		goto error_malloc;
+	}
 
-	sched.outlet = EGPMS_URB_OUTLET_SCHED(outlet_id);
-	sched.timestamp = current_kernel_time().tv_sec;
+	memset(sched, 0, sizeof(*sched));
+
+	sched->outlet = EGPMS_URB_OUTLET_SCHED(outlet_id);
+	sched->timestamp = current_kernel_time().tv_sec;
 
 	for (line_start = buf,
-	     line_split = strnstr(line_start, ";", buf - line_start + count),
-	     i = ARRAY_SIZE(sched.events) - 1;
-	     line_split < buf + count && line_split - line_start > 1;
-	     line_start = line_split + 1,
-	     line_split = strnstr(line_start, ";", buf - line_start + count)) {
+		 line_split = strnstr(line_start, ";", buf - line_start + count),
+		 i = ARRAY_SIZE(sched->events) - 1;
+		 line_split < buf + count && line_split - line_start > 1;
+		 line_start = line_split + 1,
+		 line_split = strnstr(line_start, ";", buf - line_start + count)) {
 
 		char line_buf[64];
 		char *space_split;
@@ -353,6 +387,7 @@ static ssize_t egpms_outlet_sched_store(struct device *dev,
 
 		if (line_split - line_start > 64) {
 			dev_err(&egpms->udev->dev, "Failed parsing, line unreasonably long\n");
+			kfree(sched);
 			return count;
 		}
 
@@ -369,7 +404,7 @@ static ssize_t egpms_outlet_sched_store(struct device *dev,
 		if (ret)
 			goto user_error;
 
-		ret = egpms_write_next_event_time(&sched, &i, event_time_delta);
+		ret = egpms_write_next_event_time(sched, &i, event_time_delta);
 		if (ret)
 			goto user_error;
 
@@ -377,14 +412,15 @@ static ssize_t egpms_outlet_sched_store(struct device *dev,
 			if (!strcmp(space_split, "1") ||
 					!strcmp(space_split, "on") ||
 					!strcmp(space_split, "enable")) {
-				sched.events[i] |= EGPMS_SCHED_FLAG_ENABLE;
+				sched->events[i] |= EGPMS_SCHED_FLAG_ENABLE;
 			} else if (!strcmp(space_split, "0") ||
 					!strcmp(space_split, "off") ||
 					!strcmp(space_split, "disable")) {
-				sched.events[i] &= ~EGPMS_SCHED_FLAG_ENABLE;
+				sched->events[i] &= ~EGPMS_SCHED_FLAG_ENABLE;
 			} else {
 				dev_err(&egpms->udev->dev, "Failed to parse state value '%s'\n",
 						space_split);
+				kfree(sched);
 				return count;
 			}
 		} else {
@@ -394,29 +430,35 @@ static ssize_t egpms_outlet_sched_store(struct device *dev,
 	}
 
 	++i;
-	if (i == ARRAY_SIZE(sched.events)) {
-		sched.events[i - 1] |= EGPMS_SCHED_EMPTY;
+	if (i == ARRAY_SIZE(sched->events)) {
+		sched->events[i - 1] |= EGPMS_SCHED_EMPTY;
 		i = 0;
 	}
 
-	for (; i < ARRAY_SIZE(sched.events) - 1; ++ i)
-		sched.events[i] |= EGPMS_SCHED_EMPTY;
+	for (; i < ARRAY_SIZE(sched->events) - 1; ++ i)
+		sched->events[i] |= EGPMS_SCHED_EMPTY;
 
 	ret = usb_control_msg(egpms->udev, usb_sndctrlpipe(egpms->udev, 0),
 			0x09,
 			USB_TYPE_CLASS | USB_RECIP_INTERFACE | USB_DIR_OUT,
 			EGPMS_URB_BASE + EGPMS_URB_OUTLET_SCHED(outlet_id),
-			0, &sched, sizeof(sched), EGPMS_TIMEOUT);
-	if (ret != sizeof(sched))
+			0, sched, sizeof(*sched), EGPMS_TIMEOUT);
+	if (ret != sizeof(*sched))
 		goto error;
 
+	kfree(sched);
 	return count;
 user_error:
+	kfree(sched);
 	dev_err(&egpms->udev->dev, "Failed parsing schedule\n");
 	return count;
 error:
+	kfree(sched);
 	dev_err(&egpms->udev->dev, "Failed setting schedule (%d)\n", ret);
 	return count;
+error_malloc:
+	dev_err(&egpms->udev->dev, "Cannot allocate schedule memory");
+	return 0;
 }
 
 #define EGPMS_MAX_SLOTS 4
