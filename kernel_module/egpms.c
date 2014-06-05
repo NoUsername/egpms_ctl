@@ -36,6 +36,8 @@
 
 #define EGPMS_TIMEOUT 2000
 
+#define EGPMS_CMD_SIZE 2
+
 /* Time extension, if set, this event is a extension time cell */
 #define EGPMS_SCHED_FLAG_TIME_EXT BIT(14)
 #define EGPMS_SCHED_FLAG_ENABLE BIT(15)
@@ -91,7 +93,14 @@ static ssize_t egpms_outlet_show(struct device *dev, struct device_attribute *at
 			container_of(attr, struct egpms_ext_attr, attr);
 	unsigned int outlet_id = ext_attr->outlet_id;
 	int ret;
-	u8 cmd[2];
+	int result;
+	unsigned char *cmd;
+
+	// kmalloc guarantees aligned memory (important on certain MIPS chips)
+	cmd = kmalloc(EGPMS_CMD_SIZE, GFP_DMA | GFP_KERNEL);
+	if (!cmd) {
+		goto error_malloc;
+	}
 
 	cmd[0] = EGPMS_URB_OUTLET(outlet_id);
 	cmd[1] = 0;
@@ -104,12 +113,19 @@ static ssize_t egpms_outlet_show(struct device *dev, struct device_attribute *at
 		dev_err(&egpms->udev->dev,
 				"Failed to get outlet %u state (%d)\n",
 				outlet_id, ret);
+		kfree(cmd);
 		return -1;
 	}
-	if (cmd[1] & 1)
+	result = cmd[1] & 1;
+	kfree(cmd);
+	if (result)
 		return sprintf(buf, "enabled\n");
 	else
 		return sprintf(buf, "disabled\n");
+
+error_malloc:
+	dev_err(&egpms->udev->dev, "Cannot allocate command memory");
+	return 0;
 }
 
 /*
