@@ -9,6 +9,12 @@
  *
  * Based on the protocol reverse engineered by the sispmctl project.
  * (http://sispmctl.sourceforge.net/)
+ *
+ *
+ * NOTE: kmalloc is used for allocating memory that gets passed to usb_control
+ *   functions, this might not be necessary on all architectures, but failing to
+ *   do so can produce "kernel ooops" errors e.g. on certain MIPS architecutres.
+ *   kmalloc guarantees that the returned memory is aligned properly.
  */
 
 #include <linux/kernel.h>
@@ -85,8 +91,8 @@ struct egpms_sched {
 /*
  * Get current outlet state, 0 = off, 1 = on
  */
-static ssize_t egpms_outlet_show(struct device *dev, struct device_attribute *attr,
-		char *buf)
+static ssize_t egpms_outlet_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
 {
 	struct usb_interface *intf = to_usb_interface(dev);
 	struct egpms_data *egpms = usb_get_intfdata(intf);
@@ -94,14 +100,11 @@ static ssize_t egpms_outlet_show(struct device *dev, struct device_attribute *at
 			container_of(attr, struct egpms_ext_attr, attr);
 	unsigned int outlet_id = ext_attr->outlet_id;
 	int ret;
-	int result;
 	unsigned char *cmd;
 
-	// kmalloc guarantees aligned memory (important on certain MIPS chips)
 	cmd = kmalloc(EGPMS_CMD_SIZE, GFP_DMA | GFP_KERNEL);
-	if (!cmd) {
+	if (!cmd)
 		goto error_malloc;
-	}
 
 	cmd[0] = EGPMS_URB_OUTLET(outlet_id);
 	cmd[1] = 0;
@@ -117,16 +120,16 @@ static ssize_t egpms_outlet_show(struct device *dev, struct device_attribute *at
 		kfree(cmd);
 		return -1;
 	}
-	result = cmd[1] & 1;
+	ret = cmd[1] & 1;
 	kfree(cmd);
-	if (result)
+	if (ret)
 		return sprintf(buf, "enabled\n");
 	else
 		return sprintf(buf, "disabled\n");
 
 error_malloc:
 	dev_err(&egpms->udev->dev, "Cannot allocate command memory");
-	return 0;
+	return -ENOMEM;
 }
 
 /*
@@ -145,9 +148,8 @@ static ssize_t egpms_outlet_store(struct device *dev,
 	unsigned char *cmd;
 
 	cmd = kmalloc(EGPMS_CMD_SIZE, GFP_DMA | GFP_KERNEL);
-	if (!cmd) {
+	if (!cmd)
 		goto error_malloc;
-	}
 
 	if (!strncmp("enable", buf, strlen("enable")) ||
 			!strncmp("on", buf, strlen("on"))) {
@@ -188,7 +190,7 @@ error_out:
 	return count;
 error_malloc:
 	dev_err(&egpms->udev->dev, "Cannot allocate command memory");
-	return 0;
+	return -ENOMEM;
 }
 
 static ssize_t egpms_serial_id_show(struct device *dev,
@@ -198,11 +200,9 @@ static ssize_t egpms_serial_id_show(struct device *dev,
 	struct usb_interface *intf = to_usb_interface(dev);
 	struct egpms_data *egpms = usb_get_intfdata(intf);
 	unsigned char *data;
-	data = kmalloc(EGPMS_SCHED_CMD_SIZE, GFP_DMA | GFP_KERNEL);
-	if (!data) {
+	data = kzalloc(EGPMS_SCHED_CMD_SIZE, GFP_DMA | GFP_KERNEL);
+	if (!data)
 		goto error_malloc;
-	}
-	memset(data, 0, EGPMS_SCHED_CMD_SIZE);
 
 	ret = usb_control_msg(egpms->udev, usb_rcvctrlpipe(egpms->udev, 0),
 			0x01,
@@ -223,7 +223,7 @@ error:
 	return sprintf(buf, "unknown\n");
 error_malloc:
 	dev_err(&egpms->udev->dev, "Cannot allocate data memory");
-	return 0;
+	return -ENOMEM;
 }
 DEVICE_ATTR(serial_id, S_IRUGO, egpms_serial_id_show, NULL);
 
@@ -289,15 +289,14 @@ static ssize_t egpms_outlet_sched_show(struct device *dev,
 			container_of(attr, struct egpms_ext_attr, attr);
 	unsigned int outlet_id = ext_attr->outlet_id;
 	int ret;
-	struct egpms_sched *sched = kmalloc(sizeof *sched, GFP_DMA | GFP_KERNEL);
+	struct egpms_sched *sched = kmalloc(sizeof(*sched), GFP_DMA | GFP_KERNEL);
 	u32 time = 0; /* minutes */
 	int i = ARRAY_SIZE(sched->events) - 1;
 	ssize_t count;
 	int esc = 0;
 
-	if (!sched) {
+	if (!sched)
 		goto error_malloc;
-	}
 
 	ret = usb_control_msg(egpms->udev, usb_rcvctrlpipe(egpms->udev, 0),
 			0x01,
@@ -340,7 +339,7 @@ static ssize_t egpms_outlet_sched_show(struct device *dev,
 
 error_malloc:
 	dev_err(&egpms->udev->dev, "Cannot allocate schedule struct memory");
-	return 0;
+	return -ENOMEM;
 }
 
 static ssize_t egpms_outlet_sched_store(struct device *dev,
@@ -354,25 +353,22 @@ static ssize_t egpms_outlet_sched_store(struct device *dev,
 	const char *line_split;
 	const char *line_start;
 	u32 event_time_delta; /* Minutes */
-	struct egpms_sched *sched = kmalloc(sizeof *sched, GFP_DMA | GFP_KERNEL);
+	struct egpms_sched *sched = kzalloc(sizeof(*sched), GFP_DMA | GFP_KERNEL);
 	int i;
 	int outlet_id = ext_attr->outlet_id;
 
-	if (!sched) {
+	if (!sched)
 		goto error_malloc;
-	}
-
-	memset(sched, 0, sizeof(*sched));
 
 	sched->outlet = EGPMS_URB_OUTLET_SCHED(outlet_id);
 	sched->timestamp = current_kernel_time().tv_sec;
 
 	for (line_start = buf,
-		 line_split = strnstr(line_start, ";", buf - line_start + count),
-		 i = ARRAY_SIZE(sched->events) - 1;
-		 line_split < buf + count && line_split - line_start > 1;
-		 line_start = line_split + 1,
-		 line_split = strnstr(line_start, ";", buf - line_start + count)) {
+	     line_split = strnstr(line_start, ";", buf - line_start + count),
+	     i = ARRAY_SIZE(sched->events) - 1;
+	     line_split < buf + count && line_split - line_start > 1;
+	     line_start = line_split + 1,
+	     line_split = strnstr(line_start, ";", buf - line_start + count)) {
 
 		char line_buf[64];
 		char *space_split;
@@ -386,7 +382,8 @@ static ssize_t egpms_outlet_sched_store(struct device *dev,
 		}
 
 		if (line_split - line_start > 64) {
-			dev_err(&egpms->udev->dev, "Failed parsing, line unreasonably long\n");
+			dev_err(&egpms->udev->dev,
+			        "Failed parsing, line unreasonably long\n");
 			kfree(sched);
 			return count;
 		}
@@ -458,7 +455,7 @@ error:
 	return count;
 error_malloc:
 	dev_err(&egpms->udev->dev, "Cannot allocate schedule memory");
-	return 0;
+	return -ENOMEM;
 }
 
 #define EGPMS_MAX_SLOTS 4
